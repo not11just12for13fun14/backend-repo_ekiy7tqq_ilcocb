@@ -7,6 +7,14 @@ from bson import ObjectId
 
 from database import db, create_document, get_documents
 
+# Optional OpenAI import guarded at runtime
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+try:
+    from openai import OpenAI  # type: ignore
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    openai_client = None
+
 app = FastAPI(title="ChapterSmith AI – Complete Story Builder")
 
 app.add_middleware(
@@ -40,6 +48,13 @@ class CreateProjectRequest(BaseModel):
     pov_mode: Literal["female","male","dual"] = "female"
     genre: Optional[Literal["billionaire","werewolf","mafia","general"]] = "general"
 
+class UpdateProjectRequest(BaseModel):
+    title: Optional[str] = None
+    outline: Optional[str] = None
+    chapter_count: Optional[Literal[3,4,5,6]] = None
+    pov_mode: Optional[Literal["female","male","dual"]] = None
+    genre: Optional[Literal["billionaire","werewolf","mafia","general"]] = None
+
 class ProjectResponse(BaseModel):
     id: str
     title: Optional[str] = None
@@ -61,6 +76,9 @@ class GenerateChapterRequest(BaseModel):
     number: int
     outline_hint: Optional[str] = None
     override_pov: Optional[Literal["female","male"]] = None
+    provider: Optional[Literal["openai"]] = "openai"
+    model: Optional[str] = Field(default="gpt-4o-mini")
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
 
 class SaveChapterRequest(BaseModel):
     project_id: str
@@ -85,7 +103,8 @@ def test_database():
         "database_url": None,
         "database_name": None,
         "connection_status": "Not Connected",
-        "collections": []
+        "collections": [],
+        "openai": "✅ Ready" if openai_client else ("⚠️ Not Configured" if 'OPENAI_API_KEY' in os.environ else "❌ Not Installed")
     }
     try:
         if db is not None:
@@ -127,6 +146,20 @@ def get_project(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
     return to_str_id(doc)
 
+@app.put("/api/projects/{project_id}", response_model=ProjectResponse)
+def update_project(project_id: str, payload: UpdateProjectRequest):
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        doc = db["project"].find_one({"_id": ObjectId(project_id)})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return to_str_id(doc)
+    db["project"].update_one({"_id": ObjectId(project_id)}, {"$set": updates})
+    doc = db["project"].find_one({"_id": ObjectId(project_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_str_id(doc)
+
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str):
     # delete project and its chapters
@@ -149,17 +182,39 @@ def list_chapters(project_id: str):
         ))
     return res
 
+@app.get("/api/projects/{project_id}/chapters/{number}")
+def get_chapter(project_id: str, number: int):
+    ch = db["chapter"].find_one({"project_id": project_id, "number": number})
+    if not ch:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    ch = to_str_id(ch)
+    return {
+        "project_id": project_id,
+        "number": ch.get("number"),
+        "title": ch.get("title"),
+        "content": ch.get("content"),
+        "pov_used": ch.get("pov_used"),
+        "status": ch.get("status"),
+        "word_count": ch.get("word_count")
+    }
+
+@app.delete("/api/projects/{project_id}/chapters/{number}")
+def delete_chapter(project_id: str, number: int):
+    db["chapter"].delete_one({"project_id": project_id, "number": number})
+    return {"ok": True}
+
 @app.post("/api/chapters/save")
 def save_chapter(payload: SaveChapterRequest):
     # Enforce word count if provided
     wc = len(payload.content.split()) if payload.content else 0
+    existing = db["chapter"].find_one({"project_id": payload.project_id, "number": payload.number})
     db["chapter"].update_one(
         {"project_id": payload.project_id, "number": payload.number},
         {"$set": {
             "title": payload.title,
             "content": payload.content,
             "pov_used": payload.pov_used,
-            "status": "edited" if db["chapter"].find_one({"project_id": payload.project_id, "number": payload.number}) else "generated",
+            "status": "edited" if existing and existing.get("content") else "generated",
             "word_count": wc
         }},
         upsert=True
@@ -274,3 +329,93 @@ Write the full chapter now. Output only:
         system_rules=system_rules,
         user_prompt=user_prompt.strip()
     )
+
+# ---------------------------
+# In-app AI Generation (OpenAI)
+# ---------------------------
+
+class GeneratedChapterResponse(BaseModel):
+    title: Optional[str] = None
+    content: str
+    pov_used: Literal["female","male"]
+    word_count: int
+    status: str
+
+@app.post("/api/chapters/generate", response_model=GeneratedChapterResponse)
+def generate_chapter(payload: GenerateChapterRequest):
+    # Prepare prompt and rules first
+    plan = prepare_chapter_generation(payload)
+
+    if payload.provider == "openai":
+        if openai_client is None:
+            raise HTTPException(status_code=400, detail="OpenAI is not configured. Set OPENAI_API_KEY or use copy/paste flow.")
+        try:
+            completion = openai_client.chat.completions.create(
+                model=payload.model or "gpt-4o-mini",
+                temperature=payload.temperature or 0.7,
+                messages=[
+                    {"role": "system", "content": plan.system_rules},
+                    {"role": "user", "content": plan.user_prompt},
+                ],
+            )
+            text = completion.choices[0].message.content or ""
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)[:200]}")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+
+    # Heuristic: first non-empty line as title if it looks like one; rest as content
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    extracted_title = plan.chapter_title
+    cleaned_lines: List[str] = []
+    first_nonempty_index = None
+    for idx, ln in enumerate(lines):
+        if ln:
+            first_nonempty_index = idx
+            extracted_title = ln
+            break
+    if first_nonempty_index is not None:
+        cleaned_lines = lines[first_nonempty_index+1:]
+    final_content = "\n".join(cleaned_lines).strip() if cleaned_lines else text
+
+    wc = len(final_content.split()) if final_content else 0
+    db["chapter"].update_one(
+        {"project_id": payload.project_id, "number": payload.number},
+        {"$set": {
+            "title": extracted_title,
+            "content": final_content,
+            "pov_used": plan.resolved_pov,
+            "status": "generated",
+            "word_count": wc
+        }},
+        upsert=True
+    )
+
+    return GeneratedChapterResponse(
+        title=extracted_title,
+        content=final_content,
+        pov_used=plan.resolved_pov,
+        word_count=wc,
+        status="generated"
+    )
+
+# ---------------------------
+# Export
+# ---------------------------
+
+@app.get("/api/projects/{project_id}/export")
+def export_project(project_id: str):
+    project = db["project"].find_one({"_id": ObjectId(project_id)})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    chapters = list(db["chapter"].find({"project_id": project_id}).sort("number", 1))
+    parts = []
+    title = project.get('title') or 'Untitled Project'
+    parts.append(f"# {title}\n")
+    for ch in chapters:
+        ch_title = ch.get("title") or f"Chapter {ch.get('number')}"
+        content = ch.get("content", "").strip()
+        parts.append(f"\n## {ch_title}\n\n{content}\n")
+    export_text = "\n".join(parts).strip()
+    filename = f"{(title or 'manuscript').replace(' ', '_').lower()}.md"
+    return {"filename": filename, "content": export_text}
